@@ -19,53 +19,162 @@ contract Token is IERC20, IMintableToken, IDividends {
   // ----- END: DO NOT EDIT THIS SECTION ------ //  
   // ------------------------------------------ //
 
-  // IERC20
+  // --- Declaring Events inside the Allowed Section to Fix Compilation Errors ---
+  event Transfer(address indexed from, address indexed to, uint256 value);
+  event Approval(address indexed owner, address indexed spender, uint256 value);
 
-  function allowance(address owner, address spender) external view override returns (uint256) {
-    revert();
+  
+  mapping(address => mapping(address => uint256)) public override allowance;
+
+  uint256 public totalDividendPoints;
+  uint256 public constant POINT_MULTIPLIER = 10**18;
+  mapping(address => uint256) public lastDividendPoints;
+  mapping(address => uint256) public savedDividends;
+
+  address[] private holdersIndex;
+  mapping(address => uint256) private holderPositions;
+
+  // --- Holder Management ---
+  function _addHolder(address _account) internal {
+      if (holderPositions[_account] == 0) {
+          holdersIndex.push(_account);
+          holderPositions[_account] = holdersIndex.length;
+      }
   }
 
-  function transfer(address to, uint256 value) external override returns (bool) {
-    revert();
+  function _removeHolder(address _account) internal {
+      if (balanceOf[_account] == 0 && holderPositions[_account] != 0) {
+          uint256 indexToRemove = holderPositions[_account].sub(1);
+          uint256 lastIndex = holdersIndex.length.sub(1);
+
+          if (indexToRemove != lastIndex) {
+              address lastHolder = holdersIndex[lastIndex];
+              holdersIndex[indexToRemove] = lastHolder;
+              holderPositions[lastHolder] = indexToRemove.add(1);
+          }
+
+          holdersIndex.pop();
+          delete holderPositions[_account];
+      }
   }
 
-  function approve(address spender, uint256 value) external override returns (bool) {
-    revert();
+  // --- Dividend Processing using SafeMath ---
+  function _updateDividend(address _account) internal {
+      uint256 balance = balanceOf[_account];
+      if (balance > 0) {
+          uint256 owing = totalDividendPoints.sub(lastDividendPoints[_account]);
+          if (owing > 0) {
+              savedDividends[_account] = savedDividends[_account].add((balance.mul(owing)).div(POINT_MULTIPLIER));
+          }
+      }
+      lastDividendPoints[_account] = totalDividendPoints;
   }
 
-  function transferFrom(address from, address to, uint256 value) external override returns (bool) {
-    revert();
-  }
-
-  // IMintableToken
-
+  // --- IMintableToken Logic ---
   function mint() external payable override {
-    revert();
+      require(msg.value > 0, "Cannot mint 0 tokens");
+      _updateDividend(msg.sender);
+
+      balanceOf[msg.sender] = balanceOf[msg.sender].add(msg.value);
+      totalSupply = totalSupply.add(msg.value);
+      
+      _addHolder(msg.sender);
+      emit Transfer(address(0), msg.sender, msg.value);
   }
 
-  function burn(address payable dest) external override {
-    revert();
+  function burn(address payable _refundAddress) external override {
+      require(balanceOf[msg.sender] > 0, "No tokens to burn");
+      _updateDividend(msg.sender);
+
+      uint256 burnAmount = balanceOf[msg.sender];
+      balanceOf[msg.sender] = 0;
+      totalSupply = totalSupply.sub(burnAmount);
+
+      _removeHolder(msg.sender);
+      emit Transfer(msg.sender, address(0), burnAmount);
+
+      (bool success, ) = _refundAddress.call{value: burnAmount}("");
+      require(success, "Refund transfer failed");
   }
 
-  // IDividends
+  // --- IDividends Logic ---
+  function recordDividend() external payable override {
+      require(msg.value > 0, "Empty dividend disallowed");
+      require(totalSupply > 0, "No tokens minted yet");
+
+      totalDividendPoints = totalDividendPoints.add((msg.value.mul(POINT_MULTIPLIER)).div(totalSupply));
+  }
+
+  function withdrawDividend(address payable _destination) external override {
+      _updateDividend(msg.sender);
+
+      uint256 amount = savedDividends[msg.sender];
+      require(amount > 0, "No dividends to withdraw");
+      
+      savedDividends[msg.sender] = 0;
+
+      (bool success, ) = _destination.call{value: amount}("");
+      require(success, "Dividend withdrawal failed");
+  }
+
+  function getWithdrawableDividend(address _account) external view override returns (uint256) {
+      uint256 owing = totalDividendPoints.sub(lastDividendPoints[_account]);
+      return savedDividends[_account].add((balanceOf[_account].mul(owing)).div(POINT_MULTIPLIER));
+  }
 
   function getNumTokenHolders() external view override returns (uint256) {
-    revert();
+      return holdersIndex.length;
   }
 
-  function getTokenHolder(uint256 index) external view override returns (address) {
-    revert();
+  function getTokenHolder(uint256 _index) external view override returns (address) {
+      if (_index < 1 || _index > holdersIndex.length) {
+          return address(0);
+      }
+      return holdersIndex[_index - 1];
   }
 
-  function recordDividend() external payable override {
-    revert();
+  // --- IERC20 Core Logic ---
+  function transfer(address _to, uint256 _value) external override returns (bool) {
+      require(balanceOf[msg.sender] >= _value, "Insufficient balance");
+      
+      _updateDividend(msg.sender);
+      _updateDividend(_to);
+
+      balanceOf[msg.sender] = balanceOf[msg.sender].sub(_value);
+      balanceOf[_to] = balanceOf[_to].add(_value);
+
+      if (_value > 0) {
+          _addHolder(_to);
+          _removeHolder(msg.sender);
+      }
+
+      emit Transfer(msg.sender, _to, _value);
+      return true;
   }
 
-  function getWithdrawableDividend(address payee) external view override returns (uint256) {
-    revert();
+  function approve(address _spender, uint256 _value) external override returns (bool) {
+      allowance[msg.sender][_spender] = _value;
+      emit Approval(msg.sender, _spender, _value);
+      return true;
   }
 
-  function withdrawDividend(address payable dest) external override {
-    revert();
+  function transferFrom(address _from, address _to, uint256 _value) external override returns (bool) {
+      require(balanceOf[_from] >= _value, "Insufficient balance");
+      require(allowance[_from][msg.sender] >= _value, "Allowance exceeded");
+
+      _updateDividend(_from);
+      _updateDividend(_to);
+
+      allowance[_from][msg.sender] = allowance[_from][msg.sender].sub(_value);
+      balanceOf[_from] = balanceOf[_from].sub(_value);
+      balanceOf[_to] = balanceOf[_to].add(_value);
+
+      if (_value > 0) {
+          _addHolder(_to);
+          _removeHolder(_from);
+      }
+
+      emit Transfer(_from, _to, _value);
+      return true;
   }
 }
